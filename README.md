@@ -1,148 +1,114 @@
 # SHODH — Contest Platform Backend
 
-A backend contest platform with organization-based access control, contest/problem management, idempotent submissions, and asynchronous Docker-based judging.
+Backend contest platform supporting organization-scoped access, contest/problem management, versioned problem and test-suite data, idempotent submissions, asynchronous Docker judging, and leaderboard calculation.
 
-## Technology
-- Python / FastAPI
-- PostgreSQL
-- SQLAlchemy
-- Alembic migrations
-- JWT authentication
-- Docker-based code execution
-- Pytest
-- Locust
+## Stack
+Python 3.12, FastAPI, PostgreSQL, SQLAlchemy, Alembic, JWT, Docker, Pytest, Locust.
 
 ## Architecture
-- **API:** Authentication, organizations, contests, problems, participation, submissions, and leaderboard endpoints.
-- **Database:** PostgreSQL relational persistence with migrations and indexes.
-- **Worker:** Asynchronous submission processing through persisted attempts and outbox events.
-- **Judge runner:** Executes submitted Python programs in constrained Docker containers.
-- **Outbox/recovery:** Durable job records, retry attempts, leases, and recovery of expired work.
+- **API:** Authentication, contest/problem management, participation, submission creation/status, and leaderboard.
+- **Database:** PostgreSQL; SQLAlchemy models and Alembic migrations.
+- **Submission pipeline:** Submission, attempt, and outbox event are persisted transactionally; workers asynchronously claim and judge work.
+- **Workers:** Multiple worker processes claim jobs using database coordination. Attempts use lease/token checks to prevent stale workers from persisting results.
+- **Judge:** Submitted Python is run in a Docker container with network disabled, non-root execution, read-only filesystem, resource/process limits, dropped capabilities, no-new-privileges, and bounded output.
+- **Recovery:** Expired running work is recovered and retried within the configured attempt limit. Final exhausted work is marked failed/JUDGE_ERROR.
 
-## Local setup
-1. Copy `.env.example` to `.env` if provided, then configure database and JWT settings. Do not commit secrets.
-2. Start the services:
-   ```bash
-   docker compose up --build -d
-   ```
-3. Apply migrations:
-   ```bash
-   docker compose exec api alembic upgrade head
-   ```
-4. Create demo accounts and organizations:
-   ```bash
-   docker compose exec api python seeds/seed_auth.py
-   ```
-5. API documentation:
-   - Swagger UI: `http://localhost:8000/docs`
-   - OpenAPI: `http://localhost:8000/openapi.json`
+## Setup
+```powershell
+docker compose up --build -d
+docker compose exec api alembic upgrade head
+docker compose exec api python seeds/seed_auth.py
+```
+Configure local environment values in `.env` (do not commit it). Swagger UI: `http://localhost:8000/docs`; OpenAPI: `http://localhost:8000/openapi.json`.
 
-## Demo accounts
-All demo accounts use the seed script's demo password: `ShodhDemo@2026`.
+## Demo identities
+Seed password for all accounts: `ShodhDemo@2026` (local/demo only).
 
-| Account | Organization | Role |
+| Email | Organization | Role |
 |---|---|---|
-| organizer1@shodh.dev | Shodh Organization One | Organizer |
-| participant1@shodh.dev | Shodh Organization One | Participant |
-| organizer2@shodh.dev | Shodh Organization Two | Organizer |
-| participant2@shodh.dev | Shodh Organization Two | Participant |
+| organizer1@shodh.dev | Shodh Organization One | organizer |
+| participant1@shodh.dev | Shodh Organization One | participant |
+| organizer2@shodh.dev | Shodh Organization Two | organizer |
+| participant2@shodh.dev | Shodh Organization Two | participant |
 
-Use these accounts only in a local/demo environment. Change or remove demo credentials before deployment.
+## Authorization rules
+- Users must authenticate with a valid JWT and be active.
+- Organization-scoped endpoints require membership in the target organization.
+- Organizer membership is required for contest/problem creation and problem updates, and for access to hidden test cases.
+- Participants may join published contests and submit only when joined and within contest rules/time window.
+- Participants cannot view unpublished contests or hidden test cases.
+- Submission status/source access is restricted to its owner and authorized contest organizers.
+- Cross-organization access is rejected.
 
-## API overview
-Use Swagger UI (`/docs`) for request/response schemas.
-
-- `POST /auth/token` — obtain JWT
+## API endpoints
+- `POST /auth/token` — issue token
 - `GET /auth/me` — current identity
-- `POST /organizations/{organization_id}/contests` — create contest (organizer)
-- `GET /organizations/{organization_id}/contests` — list organization contests
-- `GET /contests/{contest_id}` — contest details
-- `POST /contests/{contest_id}/join` — join published contest (participant)
+- `POST /organizations/{organization_id}/contests` — organizer creates contest
+- `GET /organizations/{organization_id}/contests` — organization contest list
+- `GET /contests/{contest_id}` — contest detail
+- `POST /contests/{contest_id}/join` — participant joins published contest
 - `GET /contests/{contest_id}/leaderboard` — paginated leaderboard
-- `POST /contests/{contest_id}/problems` — create problem (organizer)
-- `GET /contests/{contest_id}/problems` — list problems
-- `GET /problems/{problem_id}` — problem details
-- `PUT /problems/{problem_id}` — create/update problem version
-- `GET /problems/{problem_id}/test-cases` — organizer test cases
+- `POST /contests/{contest_id}/problems` — organizer creates problem
+- `GET /contests/{contest_id}/problems` — problem list; samples only
+- `GET /problems/{problem_id}` — problem detail
+- `PUT /problems/{problem_id}` — create a new problem version
+- `GET /problems/{problem_id}/test-cases` — organizer-only test cases
 - `POST /contests/{contest_id}/problems/{problem_id}/submissions` — submit code
 - `GET /submissions/{submission_id}` — submission status/result
 
-Submission requests support an `Idempotency-Key` header. Submissions pin problem and test-suite versions so judging uses the versions associated with submission time.
+Use `/docs` for full request/response schemas and interactive examples.
 
-## Judging
-The worker processes persisted jobs asynchronously. Supported verdicts include:
-- Accepted (AC)
-- Wrong Answer (WA)
-- Compilation Error (CE)
-- Runtime Error (RE)
-- Time Limit Exceeded (TLE)
-- Output Limit Exceeded (OLE)
-- Judge Error (JUDGE_ERROR)
+## Submission and attempt state model
+**Submission:** `queued → running → completed` or `queued/running → failed` after exhausted infrastructure retries.
 
-The runner uses Docker isolation with network disabled, a non-root user, read-only container filesystem, resource limits, process limits, dropped capabilities, and bounded output. Worker containers need Docker access to launch user-code containers; submitted code containers do not receive the Docker socket.
+**Judging attempt:** `queued → running → completed` or `running → failed`; expired running attempts can be recovered/retried. Attempts are numbered per submission. Lease/token checks fence stale workers. The submission records the authoritative final outcome; a stale attempt cannot overwrite it.
 
-## Tests
-Run the test suite against the configured test database:
+Submission creation accepts an `Idempotency-Key`. Repeating the same key and payload returns the existing submission; reusing the key with a different payload returns HTTP 409. Submission pins problem-version and test-suite-version IDs at creation time.
+
+## Scoring and leaderboard
+- A participant's score is derived from their best completed authoritative attempt for each problem.
+- Per-problem scores are aggregated for contest total.
+- Participants with zero score remain eligible to appear.
+- Leaderboard pagination preserves global rank.
+- Ordering is deterministic: higher total score first; ties use the earliest achievement of that score, with stable participant ordering as a final tie-breaker.
+- Failed/infrastructure attempts do not count as accepted scoring attempts.
+
+## Verdicts
+AC (Accepted), WA (Wrong Answer), CE (Compilation Error), RE (Runtime Error), TLE (Time Limit Exceeded), OLE (Output Limit Exceeded), JUDGE_ERROR (judge/infrastructure failure).
+
+## Functional evaluation
+Run:
 ```powershell
 docker compose exec -e PYTHONPATH=/app -e TEST_DATABASE_URL="postgresql+psycopg://shodh:shodh_dev_password@db:5432/shodh_test" api python -m pytest -v
 ```
+Recorded final run: **15 passed** (one third-party deprecation warning).
 
-The recorded suite result at the time of this README preparation was **15 passed**. Re-run tests against the final commit and include the new output in results.
+## Concurrent evaluation
+Concurrency tests:
+```powershell
+docker compose exec -e PYTHONPATH=/app -e TEST_DATABASE_URL="postgresql+psycopg://shodh:shodh_dev_password@db:5432/shodh_test" api python -m pytest -v tests/concurrency
+```
+These tests coordinate worker claims/recovery using controlled synchronization and verify final persistent state, including duplicate claim prevention, stale-worker fencing, lease recovery, and retry exhaustion. They exercise worker coordination against shared persistent storage.
 
-## Load testing
-Locust scenario: `locustfile.py`.
+## Load test
+Locust file: `locustfile.py`. Recorded run (20 users, 5 users/sec ramp, 60 seconds):
+```powershell
+docker compose exec api python -m locust -f /app/locustfile.py --headless -u 20 -r 5 --run-time 1m --host http://localhost:8000 --csv /app/results/locust
+```
+Results: 804 requests, 0 failures, 13.48 requests/sec, average 11 ms, median 7 ms, P95 16 ms, max 219 ms. Endpoint CSVs are saved in `results/`. This was a read-heavy workload and is not a production capacity claim.
 
-Recorded run:
-- 20 concurrent users
-- Ramp-up: 5 users/second
-- Duration: 60 seconds
-- Total requests: 804
-- Failures: 0
-- Throughput: 13.48 requests/second
-- Average latency: 11 ms
-- Median latency: 7 ms
-- 95th percentile latency: 16 ms
-- Maximum latency: 219 ms
-
-Results are saved in `results/` (CSV files and summary). These are measurements from the tested environment and dataset, not a production capacity claim.
-
-## Database indexes
-The inspected database contained 27 indexes, including:
-- `ix_contests_org_start`
-- `ix_submissions_contest_user`
-- `ix_attempts_status`
-- `ix_outbox_pending`
-- `uq_submission_idempotency`
-- `uq_contest_participant`
-- `uq_org_membership`
-
-Query-plan observations are documented in `results/database-performance.md`.
+## Database performance evidence
+Database contained 27 indexes. The contest-by-organization query used `ix_contests_org_start` (Index Scan, 0.049 ms). Submission lookup and queued-attempt query used sequential scans on the small dataset (0.030 ms and 0.015 ms). See `results/database-performance.md`.
 
 ## Repository layout
-```text
-app/
-  api/        HTTP endpoints
-  core/       configuration and security
-  judge/      Docker runner
-  models/     SQLAlchemy entities
-  schemas/    request/response schemas
-  workers/    asynchronous worker
-migrations/   Alembic migrations
-seeds/       demo data
-tests/       unit/integration/security/concurrency tests
-results/     saved test and performance evidence
-locustfile.py
-docker-compose.yml
-Dockerfile
-requirements.txt
-```
+`app/` application code; `migrations/` schema migration; `seeds/` demo seed; `tests/` integration/security/concurrency; `results/` saved evidence; `reports/` engineering report.
 
-## Known limitations / further work
-- Add a dedicated rejudge workflow with explicit rejudge/version semantics.
-- Expand load tests with a larger generated dataset and sustained/longer-duration runs.
-- Add broader automated authorization coverage for every mutation and organization boundary.
-- Add operational health checks, metrics, alerting, and production deployment hardening.
-- Review worker/outbox lease handling and failure paths further before production use.
+## Known limitations
+- Rejudge workflow and explicit rejudge/version semantics are not implemented.
+- Load test is short and read-heavy; larger dataset, write-path and sustained tests remain.
+- Broader route-by-route authorization coverage remains future work.
+- Operational health checks, metrics, alerting and deployment hardening remain.
+- Worker/outbox exception and lease edge cases merit further review.
 
-## AI assistance disclosure
-AI assistance was used for development support, debugging, drafting documentation, and test/assessment workflow guidance. Implementation, local execution, and verification results should be reviewed and reported based on actual repository and test evidence.
+## AI assistance
+See `ai-assistance-disclosure.md`.

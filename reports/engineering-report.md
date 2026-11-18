@@ -1,59 +1,41 @@
 # SHODH Contest Platform — Engineering Report
 
-## 1. Overview
-SHODH is a contest backend built with FastAPI and PostgreSQL. It supports organization membership and roles, contests, participation, versioned problems/test suites, submissions, asynchronous judging, and leaderboard results.
+## 1. Overview and architecture
+SHODH is a FastAPI/PostgreSQL contest backend with JWT authentication, organization membership/roles, contests, participation, versioned problems/test suites, submissions, asynchronous judging, and leaderboards. SQLAlchemy models and Alembic migrations manage relational persistence. Submission creation stores the submission, judging attempt, and outbox event transactionally. Workers claim persisted work using database coordination, leases, and fencing tokens. Submissions pin problem and test-suite versions.
 
-## 2. Design
-- Relational persistence with SQLAlchemy and Alembic migrations.
-- JWT-based authentication and organization membership/role authorization.
-- Submission persistence and judging enqueue are transactionally coordinated using an outbox record.
-- Submissions pin problem and test-suite versions to preserve judging context.
-- Idempotency keys prevent duplicate submission creation for repeated requests.
-- Workers claim persisted work, create judging attempts, and use leases/tokens to guard result persistence and recover expired work.
-- Leaderboard calculation uses completed authoritative attempts, includes participants with zero score, and applies stable ordering.
+## 2. State, transaction and scoring behavior
+Submission lifecycle: queued → running → completed; infrastructure retries can end in failed after the configured retry limit. Attempts are numbered and track their own state. Expired running attempts can be recovered. Lease/token checks prevent stale workers from persisting results. Idempotency keys prevent duplicate submissions: same key/payload returns the existing submission; same key/different payload returns 409.
+
+Leaderboard uses best completed authoritative attempt per problem, aggregates problem scores, includes zero-score participants, and preserves global rank during pagination. Ordering is deterministic: score descending, earliest achievement for ties, with a stable final ordering.
+
+Authorization is organization-scoped: active authenticated users require membership; organizer-only contest/problem mutations and hidden test-case access are enforced; participants join published contests before submitting; cross-organization access is rejected; submission access is limited to owner/authorized organizer.
 
 ## 3. Execution isolation
-The judge runner executes submitted Python in Docker containers configured with network disabled, a non-root user, read-only filesystem, resource limits, process limits, dropped capabilities, no-new-privileges, and bounded output. The trusted worker requires Docker access to launch containers; the user-code container is not given the Docker socket or host credentials.
+The Docker judge uses network-disabled containers, non-root execution, read-only filesystem, CPU/memory/process limits, dropped capabilities, no-new-privileges, and bounded output. Trusted workers require Docker access to launch judge containers; submitted-code containers do not receive the Docker socket or host credentials.
 
-## 4. Verification evidence
-### Automated tests
-The recorded test-suite run completed with **15 passed**. Tests cover worker concurrency, leaderboard behavior, submission idempotency, and authentication/security checks.
+## 4. Verification and performance evidence
+**Automated tests:** final recorded run: 15 passed, 1 dependency deprecation warning. Coverage includes worker concurrency/recovery, leaderboard, submission idempotency, and authentication/security.
 
-### End-to-end verdict checks
-Observed end-to-end cases included:
-- Accepted (AC)
-- Wrong Answer (WA)
-- Compilation Error (CE)
-- Time Limit Exceeded (TLE)
-- Runtime Error (RE)
-- Output Limit Exceeded (OLE)
+**Observed verdict checks:** AC, WA, CE, TLE, RE, OLE. A worker crash/restart scenario was exercised and the expired work was recovered and completed.
 
-A worker-crash recovery scenario was also exercised: work was left running, the worker was stopped, and after restart the expired work was recovered and completed.
+**Concurrency/idempotency:** concurrent same-key requests returned the same submission ID; different keys created separate IDs. Worker tests coordinate claims and assert persistent state, including duplicate claim prevention, stale-worker fencing, lease recovery, and retry exhaustion.
 
-### Idempotency and concurrency
-Concurrent requests using the same idempotency key returned the same submission ID. Concurrent requests with different keys created different submission IDs.
+**Load test:** Locust 2.43.1, 20 users, ramp-up 5/sec, 60 sec; 804 requests, 0 failures, 13.48 req/sec, average 11 ms, median 7 ms, P95 16 ms, max 219 ms. Workload covered authentication and contest/problem/leaderboard reads; results are environment-specific.
 
-### Load test
-Locust run configuration: 20 users, ramp-up 5 users/second, 60 seconds.
-- Requests: 804
-- Failures: 0
-- Throughput: 13.48 requests/second
-- Average response time: 11 ms
-- Median: 7 ms
-- P95: 16 ms
-- Maximum: 219 ms
+**Database:** 27 indexes inspected. Organization-contest query used `ix_contests_org_start` Index Scan (0.049 ms). Submission and queued-attempt queries used Seq Scan on small tables (0.030 ms and 0.015 ms); further index tuning should be based on larger data.
 
-The tested endpoints were authentication and contest/problem/leaderboard read endpoints. Results are environment- and dataset-specific and should not be interpreted as production capacity.
+## 5. Investigated failure: worker interruption and recovery
+A submission was left in the running state while worker 1 was stopped. The attempt's lease expired. After worker restart, recovery logic detected the expired work, requeued/reclaimed it, and it subsequently completed with the observed TLE verdict. This exercised restart recovery rather than relying on sleep-only timing. The result was checked through the persisted submission status. Retry exhaustion is also covered by a concurrency test.
 
-### Database/index evidence
-The inspected database had 27 indexes. The organization-contest query used `ix_contests_org_start` with an Index Scan and reported 0.049 ms execution time. Submission and queued-attempt queries used Sequential Scans on the small current dataset, reporting 0.030 ms and 0.015 ms respectively. PostgreSQL's choice is reasonable for small tables; larger datasets should be benchmarked before changing indexes.
+## 6. Reproducibility metadata
+Commit: `3805aa4` (assessment commit recorded in Git).
+Configuration: Docker Compose local services; PostgreSQL database; API and two worker services; Docker judge execution.
+Load-test mode: Locust headless, 20 users, 5 users/sec ramp, 60 seconds.
+Dataset: demo identities seeded by `seeds/seed_auth.py` (2 organizations, 4 accounts: 1 organizer and 1 participant per organization). The recorded E2E contest/problem/test-suite IDs are in the development notes; this run's load workload targeted the seeded Org One contest. Dataset was a small development dataset, not a production-scale fixture.
+Execution mode: local Docker Compose, API/worker containers, shared PostgreSQL, Docker-in-Docker-host-socket style runner access (trusted workers launch isolated judge containers).
 
-## 5. Limitations and next steps
-- Rejudge workflow and explicit rejudge/version semantics remain future work.
-- Expand load tests using a larger dataset and longer duration, including write and submission paths.
-- Increase automated authorization tests for all mutation routes and cross-organization access.
-- Add health checks, metrics, alerting, and production operational hardening.
-- Further review worker/outbox lease and exception-handling paths before production deployment.
+## 7. Limitations
+Rejudge workflow is not implemented. Load test is short/read-heavy and does not establish production capacity. Larger generated datasets, write/submission workloads, broader authorization tests, health checks/metrics/alerting, deployment hardening, and further worker/outbox edge-case review remain.
 
-## 6. Conclusion
-The implementation demonstrates the core contest lifecycle, asynchronous judging, version-pinned submissions, idempotency, worker concurrency/recovery, role-based access checks, and bounded container execution. Evidence is saved in the repository's `results/` directory. Remaining items are documented rather than represented as completed.
+## 8. Conclusion
+Core contest lifecycle, asynchronous judging, idempotency, version pinning, organization access checks, concurrency/recovery, and bounded Docker execution were implemented and verified with recorded local evidence. Limitations are explicitly identified.

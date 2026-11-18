@@ -1,3 +1,4 @@
+
 services:
   db:
     image: postgres:17-alpine
@@ -26,6 +27,30 @@ services:
     depends_on:
       db:
         condition: service_healthy
+
+  worker1:
+    build: .
+    env_file:
+      - .env
+    command: python -m app.workers.worker
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    depends_on:
+      db:
+        condition: service_healthy
+    restart: unless-stopped
+
+  worker2:
+    build: .
+    env_file:
+      - .env
+    command: python -m app.workers.worker
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    depends_on:
+      db:
+        condition: service_healthy
+    restart: unless-stopped
 
 volumes:
   postgres_data:
